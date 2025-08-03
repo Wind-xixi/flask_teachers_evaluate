@@ -1,124 +1,77 @@
-from flask import Flask, request, jsonify
-from werkzeug.utils import secure_filename
 import os
-import json
-from pathlib import Path
-from sentiment_api.models import DialogueEvaluator
-
-UPLOAD_FOLDER = 'uploads'
-MODEL_DIR = Path("/flask_backend/quantized_model")
-
-# 确保上传目录存在
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# 初始化模型（只写一次）
-evaluator = DialogueEvaluator(MODEL_DIR)
+from flask import Flask, request, jsonify
+import onnxruntime as ort
+import numpy as np
+import jieba
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MinMaxScaler
+import joblib
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+# --- 模型和文件的路径 ---
+# 使用相对路径，确保在任何地方都能找到文件
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'quantized_model.onnx')
+VECTORIZER_PATH = os.path.join(os.path.dirname(__file__), 'tfidf_vectorizer.pkl')
+SCALER_PATH = os.path.join(os.path.dirname(__file__), 'scaler.pkl')
 
-# 后面可以定义你的 API 路由，比如 /predict 等
+# --- 全局加载模型 ---
+try:
+    if not all([os.path.exists(p) for p in [MODEL_PATH, VECTORIZER_PATH, SCALER_PATH]]):
+        raise FileNotFoundError("CRITICAL: One or more model files are missing from the repository.")
 
+    ort_session = ort.InferenceSession(MODEL_PATH)
+    vectorizer = joblib.load(VECTORIZER_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    print("All models and dependencies loaded successfully.")
 
-def format_report(results, file_path):
-    lines = []
-    lines.append(f"📊 学术对话评价报告：{file_path}")
+except Exception as e:
+    print(f"FATAL ERROR during model loading: {e}")
+    ort_session = None
 
-    if results['status'] == 'no_key_sentences':
-        lines.append("⚠️ 未检测到包含学术关键词的句子")
-        return '\n'.join(lines)
+def preprocess_text(text):
+    words = " ".join(jieba.cut(text))
+    return [words]
 
-    lines.append(f"\n🔍 共找到 {results['overall_stats']['total_sentences']} 个关键评价句子")
-    lines.append("\n📈 整体统计:")
-    lines.append(f"- 平均置信度: {results['overall_stats']['avg_confidence']:.2f}")
-    lines.append(f"- 模型大小: {results['model_size_mb']:.2f} MB")
+@app.route('/evaluate_teacher', methods=['POST'])
+def evaluate_teacher():
+    if not ort_session:
+        return jsonify({"error": "Model is not available due to a server loading error."}), 500
 
-    lines.append("- 评价等级分布:")
-    for label, count in results['overall_stats']['label_distribution'].items():
-        lines.append(f"  {label}: {count} 句")
-
-    lines.append("- 场景分布:")
-    for scene, count in results['overall_stats']['scene_distribution'].items():
-        lines.append(f"  {scene}: {count} 次")
-
-    lines.append("- 情感分布:")
-    for sentiment, count in results['overall_stats']['sentiment_distribution'].items():
-        lines.append(f"  {sentiment}: {count} 次")
-
-    lines.append("\n🏆 评分最高的3个关键句子:")
-    top_sentences = sorted(results['key_sentences'], key=lambda x: x['confidence'], reverse=True)[:3]
-    for i, sent in enumerate(top_sentences, 1):
-        lines.append(f"\n{i}. 置信度: {sent['confidence']:.2f} | 等级: {sent['label']}")
-        lines.append(f"匹配信息: {json.dumps(sent['matched_info'], ensure_ascii=False)}")
-        lines.append(f"句子: {sent['sentence'][:200]}...")
-
-    lines.append("\n⚠️ 评分最低的3个关键句子:")
-    bottom_sentences = sorted(results['key_sentences'], key=lambda x: x['confidence'])[:3]
-    for i, sent in enumerate(bottom_sentences, 1):
-        lines.append(f"\n{i}. 置信度: {sent['confidence']:.2f} | 等级: {sent['label']}")
-        lines.append(f"匹配信息: {json.dumps(sent['matched_info'], ensure_ascii=False)}")
-        lines.append(f"句子: {sent['sentence'][:200]}...")
-
-    return '\n'.join(lines)
-
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
     try:
-        # 检查是否有文件上传
-        if 'file' not in request.files:
-            return jsonify({'status': 'fail', 'error': '未找到上传文件', 'details': '请求中缺少 file 字段'}), 400
+        # 确保请求中有JSON数据
+        if not request.is_json:
+            return jsonify({"error": "Invalid request: Content-Type must be application/json"}), 400
+        
+        data = request.get_json()
+        
+        if 'text' not in data:
+            return jsonify({"error": "Missing 'text' field in JSON body"}), 400
 
-        file = request.files['file']
+        text_to_evaluate = data['text']
+        
+        processed_text = preprocess_text(text_to_evaluate)
+        tfidf_features = vectorizer.transform(processed_text).toarray()
+        scaled_features = scaler.transform(tfidf_features)
+        
+        input_data = scaled_features.astype(np.float32)
 
-        # 检查文件是否有名称
-        if file.filename == '':
-            return jsonify({'status': 'fail', 'error': '未选择文件', 'details': '上传的文件名为空'}), 400
+        ort_inputs = {ort_session.get_inputs()[0].name: input_data}
+        ort_outs = ort_session.run(None, ort_inputs)
+        
+        scores = ort_outs[0][0]
+        
+        # 假设模型输出格式为 [等级, 总结] 或其他形式，请根据你的实际情况调整
+        # 这里我们先用一个模拟的返回结构
+        result = {
+            "grade": "A",
+            "summary": f"分析完成: {text_to_evaluate[:30]}..."
+        }
+        
+        return jsonify(result)
 
-        # 确保文件名安全
-        filename = secure_filename(file.filename)
-        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-
-        # 保存文件
-        file.save(save_path)
-        print(f"文件已保存至: {save_path}")
-
-        # 读取文件内容
-        with open(save_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        # 处理文件内容
-        results = evaluator.evaluate_text(content)
-        report_text = format_report(results, filename)
-
-        return jsonify({
-            'status': 'success',
-            'report': report_text,
-            'file_path': save_path,
-            'filename': filename
-        }), 200
-
-    except FileNotFoundError as e:
-        return jsonify({
-            'status': 'fail',
-            'error': '文件操作错误',
-            'details': f'文件未找到: {str(e)}'
-        }), 500
-    except UnicodeDecodeError as e:
-        return jsonify({
-            'status': 'fail',
-            'error': '编码错误',
-            'details': f'无法以 UTF-8 编码读取文件: {str(e)}'
-        }), 500
     except Exception as e:
-        # 捕获所有其他异常
-        return jsonify({
-            'status': 'fail',
-            'error': '处理请求时出错',
-            'details': str(e)
-        }), 500
+        print(f"Error during evaluation: {e}")
+        return jsonify({"error": "An internal error occurred during processing."}), 500
 
-
-if __name__ == '__main__':
-    app.run(debug=True)
+# 注意：没有 if __name__ == '__main__': ...
