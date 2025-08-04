@@ -16,15 +16,25 @@ def load_models():
     """在应用启动时加载所有教师评价模型和文件。"""
     global ort_session, vectorizer, scaler
     try:
+        # 获取当前文件所在的目录
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(base_dir, 'quantized_model.onnx')
-        vectorizer_path = os.path.join(base_dir, 'tfidf_vectorizer.pkl')
-        scaler_path = os.path.join(base_dir, 'scaler.pkl')
+        
+        # --- 核心修正点：指定模型文件在 'quantized_model' 子文件夹中 ---
+        model_folder = os.path.join(base_dir, 'quantized_model')
+        
+        model_path = os.path.join(model_folder, 'quantized_model.onnx')
+        vectorizer_path = os.path.join(model_folder, 'tfidf_vectorizer.pkl')
+        scaler_path = os.path.join(model_folder, 'scaler.pkl')
+        # --- 修正结束 ---
 
-        print("Checking for teacher evaluation model files...")
+        print("Checking for teacher evaluation model files at specified paths...")
         if not all(os.path.exists(p) for p in [model_path, vectorizer_path, scaler_path]):
-            raise FileNotFoundError("One or more teacher model files are missing.")
-        print("All teacher model files found.")
+            # 打印更详细的错误，方便调试
+            print(f"Model path exists: {os.path.exists(model_path)} -> {model_path}")
+            print(f"Vectorizer path exists: {os.path.exists(vectorizer_path)} -> {vectorizer_path}")
+            print(f"Scaler path exists: {os.path.exists(scaler_path)} -> {scaler_path}")
+            raise FileNotFoundError("One or more teacher model files are missing from the 'quantized_model' subfolder.")
+        print("All teacher model files found in 'quantized_model' subfolder.")
 
         print("Loading models for teacher evaluation...")
         ort_session = ort.InferenceSession(model_path)
