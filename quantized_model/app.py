@@ -2,59 +2,53 @@ import os
 from flask import Flask, request, jsonify
 import onnxruntime as ort
 import numpy as np
-import jieba
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import MinMaxScaler
-import joblib
+from transformers import AutoTokenizer # 导入正确的“翻译官”
 
 app = Flask(__name__)
 
 # --- 全局变量 ---
-ort_session, vectorizer, scaler = None, None, None
+ort_session = None
+tokenizer = None
 
 def load_models():
-    """在应用启动时加载所有教师评价模型和文件。"""
-    global ort_session, vectorizer, scaler
+    """在应用启动时加载ONNX模型和对应的Hugging Face分词器。"""
+    global ort_session, tokenizer
     try:
-        # --- 终极修正：直接在当前目录查找文件，因为Procfile已经帮我们进入了正确的目录 ---
-        model_path = 'quantized_model.onnx'
-        vectorizer_path = 'tfidf_vectorizer.pkl'
-        scaler_path = 'scaler.pkl'
-        # --- 修正结束 ---
-
-        print("Checking for model files in the current directory...")
-        if not all(os.path.exists(p) for p in [model_path, vectorizer_path, scaler_path]):
-            print(f"quantized_model.onnx exists: {os.path.exists(model_path)}")
-            print(f"tfidf_vectorizer.pkl exists: {os.path.exists(vectorizer_path)}")
-            print(f"scaler.pkl exists: {os.path.exists(scaler_path)}")
-            raise FileNotFoundError("One or more model files are missing from the app directory.")
+        # 假设app.py和模型/分词器文件都在同一个目录中
+        # Procfile中的 --chdir 参数会确保这一点
+        current_dir = os.path.dirname(os.path.abspath(__file__))
         
-        print("All model files found. Loading...")
+        # --- 核心修正：使用AutoTokenizer加载分词器 ---
+        # 它会自动寻找tokenizer.json, config.json, vocab.txt等文件
+        print("Loading Hugging Face Tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(current_dir)
+        print("Tokenizer loaded successfully.")
+
+        # --- 加载ONNX模型 ---
+        model_path = os.path.join(current_dir, 'model_quantized.onnx') # 确保你的模型叫这个名字
+        
+        print(f"Checking for ONNX model at: {model_path}")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"ONNX model not found at path: {model_path}")
+        
+        print("Loading ONNX session...")
         ort_session = ort.InferenceSession(model_path)
-        vectorizer = joblib.load(vectorizer_path)
-        scaler = joblib.load(scaler_path)
-        print("--- Teacher evaluation models loaded successfully! ---")
+        print("--- All models and tokenizers loaded successfully! ---")
         return True
+
     except Exception as e:
-        print(f"!!!!!!!!!! FATAL ERROR DURING MODEL LOADING: {e} !!!!!!!!!!!")
-        ort_session, vectorizer, scaler = None, None, None
+        print(f"!!!!!!!!!! FATAL ERROR DURING LOADING: {e} !!!!!!!!!!!")
+        ort_session, tokenizer = None, None
         return False
 
 # --- 在应用启动时，立即调用加载函数 ---
 load_models()
 
-def preprocess_text(text):
-    """对输入的文本进行分词和空格拼接处理"""
-    try:
-        jieba.initialize()
-    except:
-        pass
-    return [" ".join(jieba.cut(text))]
-
+# --- 教师评价接口 ---
 @app.route('/evaluate_teacher', methods=['POST'])
 def evaluate_teacher():
-    if not all([ort_session, vectorizer, scaler]):
-        return jsonify({"error": "Model is not available due to a server loading error."}), 500
+    if not all([ort_session, tokenizer]):
+        return jsonify({"error": "Model or Tokenizer is not available due to a server loading error."}), 500
 
     try:
         if not request.is_json:
@@ -66,18 +60,27 @@ def evaluate_teacher():
 
         text_to_evaluate = data['text']
         
-        processed_text = preprocess_text(text_to_evaluate)
-        tfidf_features = vectorizer.transform(processed_text).toarray()
-        scaled_features = scaler.transform(tfidf_features)
+        # --- 使用分词器进行“翻译” ---
+        inputs = tokenizer(text_to_evaluate, return_tensors="np", padding=True, truncation=True, max_length=512)
         
-        input_data = scaled_features.astype(np.float32)
+        # ONNX模型通常需要一个字典作为输入
+        # 输入的键名（如'input_ids', 'attention_mask'）需要和模型导出时的定义完全一致
+        ort_inputs = {
+            'input_ids': inputs['input_ids'].astype(np.int64),
+            'attention_mask': inputs['attention_mask'].astype(np.int64)
+        }
+        # 如果你的模型还需要 'token_type_ids'，则取消下面一行的注释
+        # ort_inputs['token_type_ids'] = inputs['token_type_ids'].astype(np.int64)
 
-        ort_inputs = {ort_session.get_inputs()[0].name: input_data}
+        # --- 运行模型 ---
         ort_outs = ort_session.run(None, ort_inputs)
         
-        scores = ort_outs[0][0]
-        grades = ['A', 'B', 'C', 'D', 'E']
-        predicted_grade = grades[np.argmax(scores)]
+        # --- 解析结果 ---
+        # 通常，分类模型的输出是一个logits数组
+        logits = ort_outs[0][0]
+        grades = ['A', 'B', 'C', 'D', 'E'] # 确保这个顺序和训练时一致
+        predicted_index = np.argmax(logits)
+        predicted_grade = grades[predicted_index]
         
         result = {
             "grade": predicted_grade,
@@ -85,6 +88,10 @@ def evaluate_teacher():
         }
         
         return jsonify(result)
+
+    except Exception as e:
+        print(f"Error during teacher evaluation: {e}")
+        return jsonify({"error": "An internal error occurred during processing."}), 500
 
     except Exception as e:
         print(f"Error during teacher evaluation: {e}")
